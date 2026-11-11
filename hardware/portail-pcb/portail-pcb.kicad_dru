@@ -1,0 +1,20 @@
+(version 1)
+# Règles de fabrication PCBWay (2 couches, 1 oz) - valeurs prudentes
+(rule "PCBWay clearance"
+  (constraint clearance (min 0.1mm)))
+(rule "PCBWay track width"
+  (constraint track_width (min 0.1mm)))
+(rule "PCBWay via diameter"
+  (constraint via_diameter (min 0.5mm)))
+(rule "PCBWay annular ring"
+  (constraint annular_width (min 0.13mm)))
+(rule "PCBWay hole size"
+  (constraint hole_size (min 0.3mm)))
+(rule "PCBWay hole to hole"
+  (constraint hole_to_hole (min 0.5mm)))
+(rule "PCBWay copper to edge"
+  (constraint edge_clearance (min 0.3mm)))
+# Isolation 230 V~ : 6 mm entre le net classe HV230 et tout le reste (la fente allonge la ligne de fuite)
+(rule "HV230 to LV 6mm"
+  (condition "A.NetClass == 'HV230' && B.NetClass != 'HV230'")
+  (constraint clearance (min 6mm)))

@@ -1,0 +1,3 @@
+#!/bin/sh
+# Run a script with KiCad's bundled Python (pcbnew available)
+exec /Applications/KiCad/KiCad.app/Contents/Frameworks/Python.framework/Versions/Current/bin/python3 "$@"
