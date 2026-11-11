@@ -11,6 +11,8 @@ Environnement : `python3 -m venv .venv && .venv/bin/pip install -r requirements.
 - Valider : `cp secrets.yaml.example secrets.yaml && .venv/bin/esphome config portail.yaml`
 - Compiler (valide les lambdas C++) : `.venv/bin/esphome compile portail.yaml`
 - Lint : `pre-commit run --all-files`
+- Carte (KiCad 10) : `hardware/scripts/build.sh` (régénère schéma + PCB, Freerouting requis hors dépôt), puis
+  `hardware/scripts/export.sh` (fichiers PCBWay dans `hardware/production/`)
 
 ## Conventions
 - Réglages dans `substitutions` ; commentaires en français ; identifiants et code en anglais.

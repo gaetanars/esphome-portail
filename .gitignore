@@ -6,3 +6,8 @@ __pycache__/
 .venv/
 # Notice FAAC : copyright, non redistribuable
 docs/*.pdf
+# Carte KiCad
+hardware/production/
+*-backups/
+fp-info-cache
+*.lck

@@ -48,6 +48,12 @@ Notice FAAC E045S, réf. 532373 Rev.A, FW 4.0 (non redistribuée : copyright FAA
 
 Les broches se changent via les `substitutions` de `portail.yaml`.
 
+## Carte dédiée (optionnel)
+
+`hardware/` contient une carte unique (KiCad 10) qui remplace les modules du commerce : ESP32-WROOM-32UE (antenne
+déportée), 2 relais, optos W.L. et LAMP, alimentation 24 V → 5 V → 3,3 V et USB-C pour le premier flash. Le brochage
+reste celui de `portail.yaml` (GPIO16/17/25/26) : aucun changement de firmware. Voir `hardware/README.md`.
+
 ## Réglages requis sur la carte
 
 | Paramètre | Valeur | Raison |
