@@ -1,0 +1,21 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(esphome config *)",
+      "Bash(esphome compile *)",
+      "Bash(pre-commit run *)",
+      "Bash(yamllint *)",
+      "Bash(git status*)",
+      "Bash(git diff*)",
+      "Bash(git log*)"
+    ],
+    "ask": [
+      "Bash(esphome run *)",
+      "Bash(esphome upload *)",
+      "Bash(esphome logs *)"
+    ],
+    "deny": [
+      "Read(./secrets.yaml)"
+    ]
+  }
+}
