@@ -1,0 +1,385 @@
+# Portail FAAC E045S - ESPHome
+# Carte    : FAAC E045S (notice réf. 532373 Rev.A, FW 4.0 - non redistribuée, voir README)
+# Entrées  : W.L. (J11 borne 20, collecteur ouvert 24 V 3 W) via optocoupleur ;
+#            LAMP (J2 bornes 7-8, 230 V~) via module de détection 230 V
+# Sorties  : relais NO sur OP-A (J3 borne 9) et OP-B (J3 borne 10) vers le commun "-" (J9 bornes 15/16)
+# Réglages carte requis : Lo = E ou EP, Sp = 00, PF = no (voir README)
+# Principe : le sens est lu sur W.L. (fixe = ouverture/ouvert, clignotante = fermeture, éteinte = fermé),
+#            le mouvement sur LAMP. La position est intégrée à partir des mouvements OBSERVÉS,
+#            quelle que soit leur origine (télécommande, bouton, HA), et recalée à 0 à chaque fermeture.
+
+substitutions:
+  name: portail
+  friendly_name: Portail
+  # Brochage : à adapter à la carte retenue (vérifier la sérigraphie)
+  pin_relay_a: GPIO16
+  pin_relay_b: GPIO17
+  pin_wl: GPIO25
+  pin_lamp: GPIO26
+  # Durées de course (s) : lire le capteur « Durée dernier mouvement » après une course complète
+  open_time_total: "20.0"
+  close_time_total: "22.0"
+  open_time_partial: "15.0"
+  close_time_partial: "15.0"
+  # W.L. considérée clignotante si deux fronts successifs sont espacés de moins de ce délai
+  flash_window_ms: "1500"
+  # Filtre de la détection 230 V (ondulation 50 Hz). À augmenter si la carte pulse elle-même LAMP.
+  lamp_off_delay: 300ms
+  pulse_time: 500ms
+  cmd_timeout: 4s
+  open_snap: "0.95"       # fin d'ouverture au-delà de 95 % => ouvert à 100 %
+  partial_overrun: "1.15" # course piéton dépassée de 15 % => le portail est passé en ouverture totale
+
+esphome:
+  name: ${name}
+  friendly_name: ${friendly_name}
+
+esp32:
+  board: esp32dev
+  framework:
+    type: esp-idf
+
+logger:
+
+api:
+  encryption:
+    key: !secret portail_api_key
+
+ota:
+  - platform: esphome
+    password: !secret portail_ota_password
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  # Point d'accès de secours si le Wi-Fi est injoignable
+  ap:
+    password: !secret wifi_ap_password
+
+captive_portal:
+
+globals:
+  - id: pos              # 0 = fermé, 1 = ouvert (vantail M1 seul en mode piéton)
+    type: float
+    restore_value: true
+    initial_value: "0.0"
+  - id: partial          # ouverture piéton en cours
+    type: bool
+    restore_value: true
+    initial_value: "false"
+  - id: last_dir         # sens du dernier mouvement : 1 ouverture, -1 fermeture
+    type: int
+    restore_value: true
+    initial_value: "-1"
+  - id: dir
+    type: int
+    initial_value: "0"
+  - id: dir_confirmed
+    type: bool
+    initial_value: "false"
+  - id: lamp_prev
+    type: bool
+    initial_value: "false"
+  - id: move_start
+    type: uint32_t
+    initial_value: "0"
+  - id: last_tick
+    type: uint32_t
+    initial_value: "0"
+  - id: wl_last_edge
+    type: uint32_t
+    initial_value: "0"
+  - id: wl_prev_edge
+    type: uint32_t
+    initial_value: "0"
+  - id: drive_tries
+    type: int
+    initial_value: "0"
+  - id: stop_tries
+    type: int
+    initial_value: "0"
+
+binary_sensor:
+  - platform: status
+    name: Statut
+    entity_category: diagnostic
+
+  # Sortie W.L. (collecteur ouvert) : optocoupleur entre +24 V et la borne 20
+  - platform: gpio
+    id: wl
+    internal: true
+    pin:
+      number: ${pin_wl}
+      mode:
+        input: true
+        pullup: true
+      inverted: true
+    filters:
+      - delayed_on_off: 20ms
+    on_state:
+      - lambda: |-
+          id(wl_prev_edge) = id(wl_last_edge);
+          id(wl_last_edge) = millis();
+          ESP_LOGD("portail", "W.L. %s (intervalle %u ms)", x ? "ON" : "OFF",
+                   (unsigned) (id(wl_last_edge) - id(wl_prev_edge)));
+
+  # Sortie LAMP 230 V : active pendant tout mouvement
+  - platform: gpio
+    id: lamp
+    internal: true
+    pin:
+      number: ${pin_lamp}
+      mode:
+        input: true
+        pullup: true
+      inverted: true
+    filters:
+      # delayed_off d'abord : il ponte l'ondulation 50 Hz, delayed_on sert ensuite d'anti-rebond.
+      # (l'inverse ne publierait jamais ON, delayed_on étant réarmé à chaque demi-période)
+      - delayed_off: ${lamp_off_delay}
+      - delayed_on: 50ms
+
+switch:
+  - platform: gpio
+    id: relay_a
+    pin: ${pin_relay_a}
+    restore_mode: ALWAYS_OFF
+    internal: true
+    interlock: [relay_b]
+  - platform: gpio
+    id: relay_b
+    pin: ${pin_relay_b}
+    restore_mode: ALWAYS_OFF
+    internal: true
+    interlock: [relay_a]
+
+script:
+  - id: pulse
+    mode: single
+    parameters:
+      use_b: bool
+    then:
+      - if:
+          condition:
+            lambda: 'return use_b;'
+          then:
+            - switch.turn_on: relay_b
+            - delay: ${pulse_time}
+            - switch.turn_off: relay_b
+          else:
+            - switch.turn_on: relay_a
+            - delay: ${pulse_time}
+            - switch.turn_off: relay_a
+
+  # Commande en boucle fermée : impulsion, observation du sens réel, correction si besoin.
+  # Fonctionne en logique E comme EP, quel que soit l'état laissé par une autre commande.
+  - id: drive
+    mode: restart
+    parameters:
+      target: int   # 1 ouvrir, -1 fermer
+      part: bool    # true = ouverture piéton (OP-B)
+    then:
+      - lambda: |-
+          id(drive_tries) = 0;
+          if (part) {
+            if (id(wl).state || id(lamp).state) {
+              ESP_LOGW("portail", "Ouverture piéton refusée : portail non fermé");
+              id(drive_tries) = 99;
+            } else {
+              id(partial) = true;
+            }
+          }
+      - while:
+          condition:
+            lambda: |-
+              bool done;
+              if (id(lamp).state) done = id(dir_confirmed) && id(dir) == target;
+              else if (target > 0) done = id(pos) >= 1.0f && id(partial) == part;
+              else done = !id(wl).state;
+              return !done && id(drive_tries) < 4;
+          then:
+            - lambda: 'id(drive_tries) += 1;'
+            - if:
+                condition:
+                  binary_sensor.is_off: lamp
+                then:
+                  - script.execute:
+                      id: pulse
+                      use_b: !lambda 'return part && id(drive_tries) == 1;'
+                  - wait_until:
+                      condition:
+                        lambda: 'return id(lamp).state && id(dir_confirmed);'
+                      timeout: ${cmd_timeout}
+                else:
+                  - wait_until:
+                      condition:
+                        lambda: 'return id(dir_confirmed);'
+                      timeout: ${cmd_timeout}
+                  - if:
+                      condition:
+                        lambda: 'return id(lamp).state && id(dir_confirmed) && id(dir) != target;'
+                      then:
+                        - script.execute:
+                            id: pulse
+                            use_b: false
+                        - wait_until:
+                            condition:
+                              lambda: 'return !id(lamp).state || id(dir) == target;'
+                            timeout: ${cmd_timeout}
+
+  # Logique EP : une impulsion arrête. Logique E en fermeture : la 1re impulsion inverse, la 2e arrête.
+  - id: stop_gate
+    mode: single
+    then:
+      - script.stop: drive
+      - lambda: 'id(stop_tries) = 0;'
+      - while:
+          condition:
+            lambda: 'return id(lamp).state && id(stop_tries) < 2;'
+          then:
+            - lambda: 'id(stop_tries) += 1;'
+            - script.execute:
+                id: pulse
+                use_b: false
+            - wait_until:
+                condition:
+                  binary_sensor.is_off: lamp
+                timeout: ${cmd_timeout}
+
+cover:
+  - platform: template
+    id: gate
+    name: None
+    device_class: gate
+    has_position: true
+    open_action:
+      - script.execute: {id: drive, target: 1, part: false}
+    close_action:
+      - script.execute: {id: drive, target: -1, part: false}
+    stop_action:
+      - script.execute: stop_gate
+
+button:
+  - platform: restart
+    name: Redémarrer
+    entity_category: diagnostic
+  - platform: template
+    name: Ouverture piéton
+    icon: mdi:walk
+    on_press:
+      - script.execute: {id: drive, target: 1, part: true}
+
+text_sensor:
+  - platform: template
+    id: etat_portail
+    name: État
+    icon: mdi:gate
+    update_interval: never
+
+sensor:
+  - platform: wifi_signal
+    name: Signal Wi-Fi
+    update_interval: 60s
+    entity_category: diagnostic
+  - platform: uptime
+    name: Uptime
+    entity_category: diagnostic
+  - platform: template
+    id: last_move
+    name: Durée dernier mouvement
+    unit_of_measurement: s
+    accuracy_decimals: 1
+    entity_category: diagnostic
+    update_interval: never
+
+interval:
+  - interval: 100ms
+    then:
+      - lambda: |-
+          const uint32_t now = millis();
+          const uint32_t T = ${flash_window_ms};
+          const bool lamp_on = id(lamp).state;
+          const bool wl_on = id(wl).state;
+          const bool flashing = (now - id(wl_last_edge)) < T &&
+                                (id(wl_last_edge) - id(wl_prev_edge)) < T;
+          const float dt = std::min((now - id(last_tick)) / 1000.0f, 1.0f);
+          id(last_tick) = now;
+
+          auto duration = [&](int d) -> float {
+            if (d > 0) return id(partial) ? ${open_time_partial} : ${open_time_total};
+            return id(partial) ? ${close_time_partial} : ${close_time_total};
+          };
+
+          // Début de mouvement
+          if (lamp_on && !id(lamp_prev)) {
+            id(move_start) = now;
+            if (!wl_on) {                      // depuis fermé : forcément une ouverture
+              id(dir) = 1;
+              id(dir_confirmed) = true;
+            } else {                        // sens supposé (inverse du précédent), confirmé par W.L.
+              id(dir) = -id(last_dir);
+              id(dir_confirmed) = false;
+            }
+          }
+
+          // Pendant le mouvement : sens lu sur W.L. (y compris inversion sur obstacle)
+          if (lamp_on) {
+            const bool was_confirmed = id(dir_confirmed);
+            if (flashing) {
+              id(dir) = -1;
+              id(dir_confirmed) = true;
+            } else if (wl_on && now - id(wl_last_edge) >= T && now - id(move_start) >= T) {
+              id(dir) = 1;
+              id(dir_confirmed) = true;
+            }
+            if (id(dir_confirmed)) {
+              const float elapsed = was_confirmed ? dt : (now - id(move_start)) / 1000.0f;
+              id(pos) += id(dir) * elapsed / duration(id(dir));
+              if (id(partial) && id(dir) > 0 && id(pos) > ${partial_overrun}) {
+                id(pos) = id(pos) * ${open_time_partial} / ${open_time_total};
+                id(partial) = false;
+              }
+              id(pos) = std::max(0.0f, std::min(id(pos), id(partial) ? 2.0f : 1.0f));
+            }
+          }
+
+          // Fin de mouvement
+          if (!lamp_on && id(lamp_prev)) {
+            if (!id(dir_confirmed))   // mouvement trop court pour confirmer : sens supposé
+              id(pos) += id(dir) * ((now - id(move_start)) / 1000.0f) / duration(id(dir));
+            if (id(dir) > 0 && id(pos) >= ${open_snap}) id(pos) = 1.0f;
+            id(pos) = std::max(0.0f, std::min(id(pos), 1.0f));
+            id(last_dir) = id(dir);
+            id(dir) = 0;
+            id(dir_confirmed) = false;
+            id(last_move).publish_state((now - id(move_start)) / 1000.0f);
+          }
+          id(lamp_prev) = lamp_on;
+
+          // Fermé : W.L. éteinte et stable, seul état connu avec certitude
+          if (!lamp_on && !wl_on && now - id(wl_last_edge) >= T) {
+            id(pos) = 0.0f;
+            id(partial) = false;
+          } else if (!lamp_on && wl_on) {
+            id(pos) = std::max(id(pos), 0.01f);   // jamais "fermé" tant que W.L. est allumée
+          }
+
+          // Publication (piéton : vantail M1 ouvert = 50 %)
+          const float shown = std::min(id(pos), 1.0f) * (id(partial) ? 0.5f : 1.0f);
+          cover::CoverOperation op = cover::COVER_OPERATION_IDLE;
+          if (lamp_on && id(dir_confirmed))
+            op = id(dir) > 0 ? cover::COVER_OPERATION_OPENING : cover::COVER_OPERATION_CLOSING;
+          if (op != id(gate).current_operation ||
+              std::fabs(shown - id(gate).position) >= 0.01f ||
+              (shown == 0.0f) != (id(gate).position == 0.0f)) {
+            id(gate).position = shown;
+            id(gate).current_operation = op;
+            id(gate).publish_state();
+          }
+
+          std::string etat;
+          if (lamp_on) etat = !id(dir_confirmed) ? "En mouvement" : (id(dir) > 0 ? "Ouverture" : "Fermeture");
+          else if (!wl_on) etat = "Fermé";
+          else if (id(pos) >= 1.0f) etat = id(partial) ? "Ouvert (piéton)" : "Ouvert";
+          else etat = "Arrêté";
+          if (etat != id(etat_portail).state) id(etat_portail).publish_state(etat);

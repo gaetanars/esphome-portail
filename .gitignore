@@ -1,0 +1,8 @@
+secrets.yaml
+.esphome/
+.pioenvs/
+.piolibdeps/
+__pycache__/
+.venv/
+# Notice FAAC : copyright, non redistribuable
+docs/*.pdf
